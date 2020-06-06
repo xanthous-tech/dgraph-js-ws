@@ -196,8 +196,6 @@ export class Txn {
     this.ws.on('error', (err) => {
       log(err);
     });
-
-    this.startHeartbeat();
   }
 
   private cleanup(): void {
