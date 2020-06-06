@@ -1,4 +1,5 @@
 export interface ResponsePayload {
+  id?: string;
   error?: string;
   message?: string;
   json?: any;

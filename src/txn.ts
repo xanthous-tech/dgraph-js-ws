@@ -1,7 +1,8 @@
 import debug from 'debug';
 import WebSocket from 'ws';
-import { ReplaySubject } from 'rxjs';
-import { take } from 'rxjs/operators';
+import { Subject, ReplaySubject } from 'rxjs';
+import { take, map, tap, filter } from 'rxjs/operators';
+import uniqid from 'uniqid';
 
 import { Mutation, MutationPayload } from './mutation';
 import { Response, ResponsePayload } from './response';
@@ -12,10 +13,10 @@ async function sleep(timeout: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, timeout));
 }
 
-export type TxnOptions = {
+export interface TxnOptions {
   readOnly?: boolean;
   bestEffort?: boolean;
-};
+}
 
 interface Vars {
   [key: string]: string | string[] | undefined;
@@ -27,6 +28,7 @@ interface QueryPayload {
 }
 
 interface RequestPayload {
+  id: string;
   query?: QueryPayload;
   mutate?: MutationPayload;
   commit?: boolean;
@@ -35,29 +37,19 @@ interface RequestPayload {
 export class Txn {
   private ws: WebSocket;
   private connectedSubject: ReplaySubject<boolean>;
-  private pingTask: NodeJS.Timeout;
+  private messageSubject: Subject<WebSocket.Data>;
+  private heartbeatTask: NodeJS.Timeout;
+  private queryCount: number;
 
-  constructor(address: string) {
+  constructor(private readonly address: string) {
     this.connectedSubject = new ReplaySubject(1);
     this.connectedSubject.next(false);
 
-    log('connecting');
+    this.messageSubject = new Subject();
 
-    this.ws = new WebSocket(address);
+    this.queryCount = 0;
 
-    this.ws.on('open', () => {
-      log(`connected to ${address}`);
-      this.connectedSubject.next(true);
-      this.pingTask = setInterval(() => {
-        this.ws.ping();
-      }, 3000);
-    });
-
-    this.ws.on('close', () => {
-      log(`disconnected`);
-      this.connectedSubject.next(false);
-      clearInterval(this.pingTask);
-    });
+    this.init();
   }
 
   public async query(q: string): Promise<Response> {
@@ -68,6 +60,7 @@ export class Txn {
     await this.waitUntilConnected();
 
     const request: RequestPayload = {
+      id: uniqid(),
       query: {
         q,
         vars,
@@ -76,57 +69,27 @@ export class Txn {
 
     log(JSON.stringify(request));
 
-    return new Promise((resolve, reject) => {
-      this.ws.once('message', (data) => {
-        try {
-          const payload: ResponsePayload = JSON.parse(data.toString());
-          if (payload.error) {
-            reject(new Error(payload.error));
-          } else {
-            resolve(new Response(payload));
-          }
-        } catch (e) {
-          log(e);
-          reject(e);
-        }
-      });
-
-      this.ws.send(JSON.stringify(request));
-    });
+    return this.sendRequest(request);
   }
 
   public async mutate(mu: Mutation): Promise<Response> {
     await this.waitUntilConnected();
 
     const request: RequestPayload = {
+      id: uniqid(),
       mutate: mu.getPayload(),
     };
 
     log(JSON.stringify(request));
 
-    return new Promise((resolve, reject) => {
-      this.ws.once('message', (data) => {
-        try {
-          const payload: ResponsePayload = JSON.parse(data.toString());
-          if (payload.error) {
-            reject(new Error(payload.error));
-          } else {
-            resolve(new Response(payload));
-          }
-        } catch (e) {
-          log(e);
-          reject(e);
-        }
-      });
-
-      this.ws.send(JSON.stringify(request));
-    });
+    return this.sendRequest(request);
   }
 
   public async upsertWithVars(q: string, mu: Mutation, vars?: Vars): Promise<Response> {
     await this.waitUntilConnected();
 
     const request: RequestPayload = {
+      id: uniqid(),
       query: {
         q,
         vars,
@@ -136,51 +99,20 @@ export class Txn {
 
     log(JSON.stringify(request));
 
-    return new Promise((resolve, reject) => {
-      this.ws.once('message', (data) => {
-        try {
-          const payload: ResponsePayload = JSON.parse(data.toString());
-          if (payload.error) {
-            reject(new Error(payload.error));
-          } else {
-            resolve(new Response(payload));
-          }
-        } catch (e) {
-          log(e);
-          reject(e);
-        }
-      });
-
-      this.ws.send(JSON.stringify(request));
-    });
+    return this.sendRequest(request);
   }
 
   public async commit(): Promise<Response> {
     await this.waitUntilConnected();
 
     const request: RequestPayload = {
+      id: uniqid(),
       commit: true,
     };
 
     log(JSON.stringify(request));
 
-    return new Promise((resolve, reject) => {
-      this.ws.once('message', (data) => {
-        try {
-          const payload: ResponsePayload = JSON.parse(data.toString());
-          if (payload.error) {
-            reject(new Error(payload.error));
-          } else {
-            resolve(new Response(payload));
-          }
-        } catch (e) {
-          log(e);
-          reject(e);
-        }
-      });
-
-      this.ws.send(JSON.stringify(request));
-    });
+    return this.sendRequest(request);
   }
 
   public async discard(): Promise<Response> {
@@ -189,8 +121,35 @@ export class Txn {
     log('discarding');
 
     this.ws.close();
-    clearInterval(this.pingTask);
     return Promise.resolve(new Response({}));
+  }
+
+  private sendRequest(request: RequestPayload): Promise<Response> {
+    return new Promise((resolve, reject) => {
+      this.messageSubject
+        .pipe(
+          map((data) => data.toString()),
+          tap((dataString) => log(`{"requestId": "${request.id}", "response": ${dataString}}`)),
+          map((dataString) => JSON.parse(dataString) as ResponsePayload),
+          filter((response) => response.id === request.id),
+          take(1),
+        )
+        .subscribe(
+          (payload) => {
+            if (payload.error) {
+              reject(new Error(payload.error));
+            } else {
+              resolve(new Response(payload));
+            }
+          },
+          (e) => {
+            log(e);
+            reject(e);
+          },
+        );
+
+      this.ws.send(JSON.stringify(request));
+    });
   }
 
   private async waitUntilConnected(): Promise<void> {
@@ -199,11 +158,68 @@ export class Txn {
       await sleep(5);
       connected = await this.isConnected();
     }
+    this.queryCount += 1;
   }
 
   private async isConnected(): Promise<boolean> {
     const observable = this.connectedSubject.pipe(take(1));
 
     return observable.toPromise();
+  }
+
+  private init(): void {
+    this.ws = new WebSocket(this.address);
+
+    this.ws.on('open', () => {
+      log(`connected to ${this.address}`);
+      this.connectedSubject.next(true);
+      this.startHeartbeat();
+    });
+
+    this.ws.on('close', () => {
+      log(`disconnected`);
+      this.connectedSubject.next(false);
+      this.cleanup();
+    });
+
+    this.ws.on('message', (data: WebSocket.Data) => {
+      log('decrement query count');
+      this.queryCount -= 1;
+
+      this.messageSubject.next(data);
+    });
+
+    this.ws.on('pong', () => {
+      log('got heartbeat');
+    });
+
+    this.ws.on('error', (err) => {
+      log(err);
+    });
+
+    this.startHeartbeat();
+  }
+
+  private cleanup(): void {
+    log('cleanup');
+    this.ws.removeAllListeners();
+    this.killHeartbeat();
+  }
+
+  private startHeartbeat(): void {
+    log('starting heartbeat');
+    this.heartbeatTask = setInterval(() => {
+      if (this.queryCount > 0) {
+        log(`sending heartbeat, query count ${this.queryCount}`);
+        this.ws.ping();
+      } else {
+        log('skipping heartbeat since no active requests');
+      }
+    }, 3000);
+  }
+
+  private killHeartbeat(): void {
+    log('killing heartbeat');
+    clearInterval(this.heartbeatTask);
   }
 }
