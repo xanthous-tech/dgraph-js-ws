@@ -1,6 +1,6 @@
 {
   "name": "dgraph-js-ws",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "description": "dGraph JS WebSocket Client",
   "main": "lib/index.js",
   "author": "Simon Liang <simon@x-tech.io>",
