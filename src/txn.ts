@@ -38,16 +38,12 @@ export class Txn {
   private ws: WebSocket;
   private connectedSubject: ReplaySubject<boolean>;
   private messageSubject: Subject<WebSocket.Data>;
-  private heartbeatTask: NodeJS.Timeout;
-  private queryCount: number;
 
   constructor(private readonly address: string) {
     this.connectedSubject = new ReplaySubject(1);
     this.connectedSubject.next(false);
 
     this.messageSubject = new Subject();
-
-    this.queryCount = 0;
 
     this.init();
   }
@@ -158,7 +154,6 @@ export class Txn {
       await sleep(5);
       connected = await this.isConnected();
     }
-    this.queryCount += 1;
   }
 
   private async isConnected(): Promise<boolean> {
@@ -173,7 +168,6 @@ export class Txn {
     this.ws.on('open', () => {
       log(`connected to ${this.address}`);
       this.connectedSubject.next(true);
-      this.startHeartbeat();
     });
 
     this.ws.on('close', () => {
@@ -183,9 +177,6 @@ export class Txn {
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
-      log('decrement query count');
-      this.queryCount -= 1;
-
       this.messageSubject.next(data);
     });
 
@@ -201,23 +192,5 @@ export class Txn {
   private cleanup(): void {
     log('cleanup');
     this.ws.removeAllListeners();
-    this.killHeartbeat();
-  }
-
-  private startHeartbeat(): void {
-    log('starting heartbeat');
-    this.heartbeatTask = setInterval(() => {
-      if (this.queryCount > 0) {
-        log(`sending heartbeat, query count ${this.queryCount}`);
-        this.ws.ping();
-      } else {
-        log('skipping heartbeat since no active requests');
-      }
-    }, 3000);
-  }
-
-  private killHeartbeat(): void {
-    log('killing heartbeat');
-    clearInterval(this.heartbeatTask);
   }
 }
